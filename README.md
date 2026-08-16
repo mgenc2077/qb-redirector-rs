@@ -1,4 +1,4 @@
-# qb-redirector
+# qb-redirector-rs
 
 A small torrent router for machines that talk to more than one qBittorrent
 instance (e.g. one for private trackers, one for public). Opening a `.torrent`
@@ -70,10 +70,14 @@ password = "secret"
 
 Single torrents (`.torrent` file or magnet link):
 
+<img src="screenshots/torrent-file.png" alt="Open with qBittorrent Router in the file manager context menu" width="460">
+
 1. A radiolist shows every instance–category combination ("no category"
    entries last). Picking a category sends the torrent to that category's save
    path; picking "no category" asks for a download path (prefilled with the
    instance's default).
+
+   <img src="screenshots/Add-menu.png" alt="Instance and category chooser dialog" width="300">
 2. The torrent is added stopped and a checklist of its files appears — untick
    what you don't want (skipped files are set to "do not download"). Magnets
    briefly start to fetch metadata first. Cancelling the checklist removes the
@@ -83,8 +87,11 @@ Single torrents (`.torrent` file or magnet link):
 ## Batch import (open a folder)
 
 Opening a **folder** with the redirector adds every `.torrent` directly inside
-it in one go — started immediately, no per-file dialogs. The folder must
-contain an `import-config.json`:
+it in one go — started immediately, no per-file dialogs.
+
+<img src="screenshots/batch-import.png" alt="Open Folder With qBittorrent Router in the file manager context menu" width="640">
+
+The folder must contain an `import-config.json`:
 
 ```json
 {
