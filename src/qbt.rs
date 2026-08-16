@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
@@ -34,15 +34,8 @@ pub fn login(
     }
 }
 
-pub struct Category {
-    pub name: String,
-    /// Empty when the category has no explicit save path (it then uses the
-    /// instance's default).
-    pub save_path: String,
-}
-
-/// Returns the instance's categories, sorted by name.
-pub fn fetch_categories(client: &Client, base_url: &str) -> Result<Vec<Category>, String> {
+/// Returns the instance's category names, sorted alphabetically.
+pub fn fetch_categories(client: &Client, base_url: &str) -> Result<Vec<String>, String> {
     let response = client
         .get(format!("{base_url}/api/v2/torrents/categories"))
         .send()
@@ -55,13 +48,116 @@ pub fn fetch_categories(client: &Client, base_url: &str) -> Result<Vec<Category>
     let categories: BTreeMap<String, serde_json::Value> = response
         .json()
         .map_err(|e| format!("Could not parse category list: {e}"))?;
-    Ok(categories
-        .into_iter()
-        .map(|(name, details)| Category {
-            name,
-            save_path: details["savePath"].as_str().unwrap_or("").to_string(),
+    Ok(categories.into_keys().collect())
+}
+
+/// Hashes of all torrents currently known to the instance.
+pub fn list_hashes(client: &Client, base_url: &str) -> Result<HashSet<String>, String> {
+    let response = client
+        .get(format!("{base_url}/api/v2/torrents/info"))
+        .send()
+        .map_err(|e| format!("Torrent list request failed: {e}"))?;
+    let torrents: Vec<serde_json::Value> = response
+        .json()
+        .map_err(|e| format!("Could not parse torrent list: {e}"))?;
+    Ok(torrents
+        .iter()
+        .filter_map(|t| t["hash"].as_str().map(String::from))
+        .collect())
+}
+
+pub struct TorrentFile {
+    pub id: i64,
+    pub name: String,
+    pub size: u64,
+}
+
+/// The files of one torrent; empty until (magnet) metadata is available.
+pub fn fetch_files(client: &Client, base_url: &str, hash: &str) -> Result<Vec<TorrentFile>, String> {
+    let response = client
+        .get(format!("{base_url}/api/v2/torrents/files"))
+        .query(&[("hash", hash)])
+        .send()
+        .map_err(|e| format!("File list request failed: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("File list request failed (HTTP {})", response.status().as_u16()));
+    }
+    let files: Vec<serde_json::Value> = response
+        .json()
+        .map_err(|e| format!("Could not parse file list: {e}"))?;
+    Ok(files
+        .iter()
+        .enumerate()
+        .map(|(position, f)| TorrentFile {
+            // Older API versions have no "index" field; there the position in
+            // the array is the file id.
+            id: f["index"].as_i64().unwrap_or(position as i64),
+            name: f["name"].as_str().unwrap_or("?").to_string(),
+            size: f["size"].as_u64().unwrap_or(0),
         })
         .collect())
+}
+
+/// Marks the given file ids as "do not download".
+pub fn skip_files(client: &Client, base_url: &str, hash: &str, ids: &[i64]) -> Result<(), String> {
+    let id_list = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("|");
+    let response = client
+        .post(format!("{base_url}/api/v2/torrents/filePrio"))
+        .form(&[("hash", hash), ("id", &id_list), ("priority", "0")])
+        .send()
+        .map_err(|e| format!("File priority request failed: {e}"))?;
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("File priority request failed (HTTP {})", response.status().as_u16()))
+    }
+}
+
+/// POSTs `hashes=<hash>` to the first of the given endpoints the server
+/// knows; qBittorrent 5.x renamed pause/resume to stop/start.
+fn torrent_action(
+    client: &Client,
+    base_url: &str,
+    endpoints: &[&str],
+    hash: &str,
+) -> Result<(), String> {
+    let mut last_status = 0;
+    for endpoint in endpoints {
+        let response = client
+            .post(format!("{base_url}/api/v2/torrents/{endpoint}"))
+            .form(&[("hashes", hash)])
+            .send()
+            .map_err(|e| format!("{endpoint} request failed: {e}"))?;
+        last_status = response.status().as_u16();
+        if response.status().is_success() {
+            return Ok(());
+        }
+        if last_status != 404 {
+            break;
+        }
+    }
+    Err(format!("{} request failed (HTTP {last_status})", endpoints[0]))
+}
+
+pub fn start_torrent(client: &Client, base_url: &str, hash: &str) -> Result<(), String> {
+    torrent_action(client, base_url, &["start", "resume"], hash)
+}
+
+pub fn stop_torrent(client: &Client, base_url: &str, hash: &str) -> Result<(), String> {
+    torrent_action(client, base_url, &["stop", "pause"], hash)
+}
+
+pub fn delete_torrent(client: &Client, base_url: &str, hash: &str) -> Result<(), String> {
+    let response = client
+        .post(format!("{base_url}/api/v2/torrents/delete"))
+        .form(&[("hashes", hash), ("deleteFiles", "true")])
+        .send()
+        .map_err(|e| format!("Delete request failed: {e}"))?;
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("Delete request failed (HTTP {})", response.status().as_u16()))
+    }
 }
 
 /// Returns the instance's default save path (a path on the server).
@@ -83,7 +179,10 @@ pub fn add_magnet(
     category: Option<&str>,
     save_path: Option<&str>,
 ) -> Result<(), String> {
-    let mut form = vec![("urls", magnet)];
+    // Always add stopped so files can be deselected before anything
+    // downloads; qBittorrent 5.x wants "stopped", 4.x "paused" — the unknown
+    // one is ignored.
+    let mut form = vec![("urls", magnet), ("stopped", "true"), ("paused", "true")];
     if let Some(category) = category {
         form.push(("category", category));
         // Without auto torrent management the category's save path is
@@ -118,7 +217,10 @@ pub fn add_torrent_file(
     )
     .mime_str("application/x-bittorrent")
     .map_err(|e| e.to_string())?;
-    let mut form = multipart::Form::new().part("torrents", file_part);
+    let mut form = multipart::Form::new()
+        .part("torrents", file_part)
+        .text("stopped", "true")
+        .text("paused", "true");
     if let Some(category) = category {
         form = form
             .text("category", category.to_string())

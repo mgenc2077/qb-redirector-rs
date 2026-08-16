@@ -40,6 +40,38 @@ pub fn radiolist(labels: &[String], default_index: usize) -> Result<Option<usize
     Ok(Some(index))
 }
 
+/// Shows a checklist with every entry preselected. Returns the indices of
+/// the entries left checked, or `None` if the user cancelled.
+pub fn checklist(question: &str, labels: &[String]) -> Result<Option<Vec<usize>>, String> {
+    let mut args = vec!["--checklist".to_string(), question.to_string()];
+    for (index, label) in labels.iter().enumerate() {
+        args.push(index.to_string());
+        args.push(label.clone());
+        args.push("on".to_string());
+    }
+    args.push("--title".to_string());
+    args.push(TITLE.to_string());
+    let output = Command::new("kdialog")
+        .args(args)
+        .output()
+        .map_err(|e| format!("Could not run kdialog: {e}"))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    // stdout holds the checked tags as quoted, space-separated numbers,
+    // e.g. `"0" "2"`.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut selected = Vec::new();
+    for token in stdout.split_whitespace() {
+        let index: usize = token
+            .trim_matches('"')
+            .parse()
+            .map_err(|_| format!("Unexpected kdialog output: {token:?}"))?;
+        selected.push(index);
+    }
+    Ok(Some(selected))
+}
+
 /// Shows a text input box. Returns the entered value, or `None` if the user
 /// cancelled.
 pub fn input_box(prompt: &str, initial: &str) -> Result<Option<String>, String> {

@@ -4,6 +4,7 @@ mod qbt;
 
 use std::path::Path;
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use reqwest::blocking::Client;
 
@@ -116,6 +117,9 @@ fn run() -> Result<(), String> {
         }
     }
 
+    // The torrent is added stopped; we find it by diffing the hash list,
+    // read its files, let the user deselect some, then start it.
+    let known_hashes = qbt::list_hashes(client, base_url).unwrap_or_default();
     if qbt::is_magnet(&target) {
         qbt::add_magnet(client, base_url, &target, category, save_path.as_deref())?;
     } else {
@@ -127,9 +131,102 @@ fn run() -> Result<(), String> {
             save_path.as_deref(),
         )?;
     }
+    let hash = poll(Duration::from_secs(10), || {
+        qbt::list_hashes(client, base_url)
+            .ok()?
+            .difference(&known_hashes)
+            .next()
+            .cloned()
+    })
+    .ok_or("Torrent was accepted but never appeared in the torrent list.")?;
 
+    // A .torrent file's list is available immediately; a magnet has no files
+    // until its metadata arrives, which needs the torrent running. Only
+    // metadata can transfer before the file list exists, so nothing unwanted
+    // is downloaded while we wait.
+    let mut files = poll(Duration::from_secs(3), || {
+        non_empty(qbt::fetch_files(client, base_url, &hash).unwrap_or_default())
+    });
+    if files.is_none() {
+        kdialog::success_popup("Fetching torrent metadata…");
+        qbt::start_torrent(client, base_url, &hash)?;
+        files = poll(Duration::from_secs(60), || {
+            non_empty(qbt::fetch_files(client, base_url, &hash).unwrap_or_default())
+        });
+        let _ = qbt::stop_torrent(client, base_url, &hash);
+    }
+    let Some(files) = files else {
+        // Metadata never arrived; start it with everything selected rather
+        // than dropping the torrent.
+        qbt::start_torrent(client, base_url, &hash)?;
+        kdialog::success_popup(&format!(
+            "Sent to {} (metadata still pending, all files selected).",
+            picked.label
+        ));
+        return Ok(());
+    };
+
+    if files.len() > 1 {
+        let labels: Vec<String> = files
+            .iter()
+            .map(|f| format!("{} ({})", f.name, human_size(f.size)))
+            .collect();
+        let Some(checked) = kdialog::checklist("Select the files to download:", &labels)? else {
+            let _ = qbt::delete_torrent(client, base_url, &hash);
+            return Ok(()); // user cancelled -> remove the stopped torrent
+        };
+        let skipped: Vec<i64> = files
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !checked.contains(index))
+            .map(|(_, f)| f.id)
+            .collect();
+        if skipped.len() == files.len() {
+            let _ = qbt::delete_torrent(client, base_url, &hash);
+            return Ok(()); // nothing selected -> same as cancelling
+        }
+        if !skipped.is_empty() {
+            qbt::skip_files(client, base_url, &hash, &skipped)?;
+        }
+    }
+
+    qbt::start_torrent(client, base_url, &hash)?;
     kdialog::success_popup(&format!("Successfully sent to {}.", picked.label));
     Ok(())
+}
+
+/// Calls `check` every half second until it yields a value or the timeout
+/// elapses.
+fn poll<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> Option<T> {
+    let start = Instant::now();
+    loop {
+        if let Some(value) = check() {
+            return Some(value);
+        }
+        if start.elapsed() >= timeout {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+fn non_empty<T>(items: Vec<T>) -> Option<Vec<T>> {
+    if items.is_empty() { None } else { Some(items) }
+}
+
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
 }
 
 #[cfg(test)]
@@ -173,6 +270,14 @@ mod tests {
         assert_eq!(targets[3].category, None);
         assert_eq!(targets[3].instance, 0);
         assert_eq!(targets[4].instance, 1);
+    }
+
+    #[test]
+    fn human_readable_sizes() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(999), "999 B");
+        assert_eq!(human_size(214_700_000), "204.8 MiB");
+        assert_eq!(human_size(4_284_481_536), "4.0 GiB");
     }
 
     #[test]
