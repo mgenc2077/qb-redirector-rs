@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -33,16 +34,80 @@ pub fn login(
     }
 }
 
-pub fn add_magnet(client: &Client, base_url: &str, magnet: &str) -> Result<(), String> {
+pub struct Category {
+    pub name: String,
+    /// Empty when the category has no explicit save path (it then uses the
+    /// instance's default).
+    pub save_path: String,
+}
+
+/// Returns the instance's categories, sorted by name.
+pub fn fetch_categories(client: &Client, base_url: &str) -> Result<Vec<Category>, String> {
+    let response = client
+        .get(format!("{base_url}/api/v2/torrents/categories"))
+        .send()
+        .map_err(|e| format!("Category request failed: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("Category request failed (HTTP {})", response.status().as_u16()));
+    }
+    // The response maps category name -> details; the BTreeMap keys give us
+    // the sorted names directly.
+    let categories: BTreeMap<String, serde_json::Value> = response
+        .json()
+        .map_err(|e| format!("Could not parse category list: {e}"))?;
+    Ok(categories
+        .into_iter()
+        .map(|(name, details)| Category {
+            name,
+            save_path: details["savePath"].as_str().unwrap_or("").to_string(),
+        })
+        .collect())
+}
+
+/// Returns the instance's default save path (a path on the server).
+pub fn fetch_default_save_path(client: &Client, base_url: &str) -> Result<String, String> {
+    let response = client
+        .get(format!("{base_url}/api/v2/app/defaultSavePath"))
+        .send()
+        .map_err(|e| format!("Save path request failed: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("Save path request failed (HTTP {})", response.status().as_u16()));
+    }
+    Ok(response.text().map_err(|e| e.to_string())?.trim().to_string())
+}
+
+pub fn add_magnet(
+    client: &Client,
+    base_url: &str,
+    magnet: &str,
+    category: Option<&str>,
+    save_path: Option<&str>,
+) -> Result<(), String> {
+    let mut form = vec![("urls", magnet)];
+    if let Some(category) = category {
+        form.push(("category", category));
+        // Without auto torrent management the category's save path is
+        // ignored and the torrent lands in the global default location.
+        form.push(("autoTMM", "true"));
+    }
+    if let Some(save_path) = save_path {
+        form.push(("savepath", save_path));
+    }
     let response = client
         .post(format!("{base_url}/api/v2/torrents/add"))
-        .form(&[("urls", magnet)])
+        .form(&form)
         .send()
         .map_err(|e| format!("Request failed: {e}"))?;
     check_add_response(response.status().as_u16())
 }
 
-pub fn add_torrent_file(client: &Client, base_url: &str, path: &Path) -> Result<(), String> {
+pub fn add_torrent_file(
+    client: &Client,
+    base_url: &str,
+    path: &Path,
+    category: Option<&str>,
+    save_path: Option<&str>,
+) -> Result<(), String> {
     let file_part = multipart::Part::bytes(
         std::fs::read(path).map_err(|e| format!("Could not read {}: {e}", path.display()))?,
     )
@@ -53,9 +118,18 @@ pub fn add_torrent_file(client: &Client, base_url: &str, path: &Path) -> Result<
     )
     .mime_str("application/x-bittorrent")
     .map_err(|e| e.to_string())?;
+    let mut form = multipart::Form::new().part("torrents", file_part);
+    if let Some(category) = category {
+        form = form
+            .text("category", category.to_string())
+            .text("autoTMM", "true");
+    }
+    if let Some(save_path) = save_path {
+        form = form.text("savepath", save_path.to_string());
+    }
     let response = client
         .post(format!("{base_url}/api/v2/torrents/add"))
-        .multipart(multipart::Form::new().part("torrents", file_part))
+        .multipart(form)
         .send()
         .map_err(|e| format!("Request failed: {e}"))?;
     check_add_response(response.status().as_u16())

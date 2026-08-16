@@ -637,6 +637,7 @@ dependencies = [
  "dirs",
  "reqwest",
  "serde",
+ "serde_json",
  "toml",
 ]
 

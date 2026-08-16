@@ -14,6 +14,7 @@ pub struct Instance {
     pub url: String,
     #[serde(default)]
     pub default: bool,
+    pub default_category: Option<String>,
     pub username: Option<String>,
     pub password: Option<String>,
 }
@@ -22,11 +23,14 @@ const DEFAULT_CONFIG: &str = r#"[[instances]]
 name = "Private Tracker"
 url = "https://qb-private.tail5a66c8.ts.net"
 default = true
+# default_category = "Movies"   # preselect this category in the chooser
+# username = "admin"            # uncomment to enable auth
+# password = "secret"
 
 [[instances]]
 name = "Public Tracker"
 url = "https://qb-public.tail5a66c8.ts.net"
-# username = "admin"   # uncomment to enable auth
+# username = "admin"
 # password = "secret"
 "#;
 
@@ -84,6 +88,7 @@ mod tests {
                 name: "Private".into(),
                 url: "https://example.com".into(),
                 default: true,
+                default_category: Some("Movies".into()),
                 username: Some("admin".into()),
                 password: Some("secret".into()),
             }],
