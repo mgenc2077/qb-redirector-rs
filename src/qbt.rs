@@ -172,26 +172,50 @@ pub fn fetch_default_save_path(client: &Client, base_url: &str) -> Result<String
     Ok(response.text().map_err(|e| e.to_string())?.trim().to_string())
 }
 
+#[derive(Default)]
+pub struct AddOptions {
+    pub category: Option<String>,
+    pub save_path: Option<String>,
+    /// Add without starting; qBittorrent 5.x wants "stopped", 4.x "paused" —
+    /// the unknown one is ignored.
+    pub stopped: bool,
+}
+
+impl AddOptions {
+    /// Auto torrent management makes the category's save path apply, but it
+    /// also overrides an explicit save path — so it is only sent when a
+    /// category is given without one.
+    fn auto_tmm(&self) -> bool {
+        self.category.is_some() && self.save_path.is_none()
+    }
+
+    fn form_fields(&self) -> Vec<(&'static str, String)> {
+        let mut fields = Vec::new();
+        if self.stopped {
+            fields.push(("stopped", "true".to_string()));
+            fields.push(("paused", "true".to_string()));
+        }
+        if let Some(category) = &self.category {
+            fields.push(("category", category.clone()));
+        }
+        if self.auto_tmm() {
+            fields.push(("autoTMM", "true".to_string()));
+        }
+        if let Some(save_path) = &self.save_path {
+            fields.push(("savepath", save_path.clone()));
+        }
+        fields
+    }
+}
+
 pub fn add_magnet(
     client: &Client,
     base_url: &str,
     magnet: &str,
-    category: Option<&str>,
-    save_path: Option<&str>,
+    options: &AddOptions,
 ) -> Result<(), String> {
-    // Always add stopped so files can be deselected before anything
-    // downloads; qBittorrent 5.x wants "stopped", 4.x "paused" — the unknown
-    // one is ignored.
-    let mut form = vec![("urls", magnet), ("stopped", "true"), ("paused", "true")];
-    if let Some(category) = category {
-        form.push(("category", category));
-        // Without auto torrent management the category's save path is
-        // ignored and the torrent lands in the global default location.
-        form.push(("autoTMM", "true"));
-    }
-    if let Some(save_path) = save_path {
-        form.push(("savepath", save_path));
-    }
+    let mut form = vec![("urls", magnet.to_string())];
+    form.extend(options.form_fields());
     let response = client
         .post(format!("{base_url}/api/v2/torrents/add"))
         .form(&form)
@@ -204,8 +228,7 @@ pub fn add_torrent_file(
     client: &Client,
     base_url: &str,
     path: &Path,
-    category: Option<&str>,
-    save_path: Option<&str>,
+    options: &AddOptions,
 ) -> Result<(), String> {
     let file_part = multipart::Part::bytes(
         std::fs::read(path).map_err(|e| format!("Could not read {}: {e}", path.display()))?,
@@ -217,17 +240,9 @@ pub fn add_torrent_file(
     )
     .mime_str("application/x-bittorrent")
     .map_err(|e| e.to_string())?;
-    let mut form = multipart::Form::new()
-        .part("torrents", file_part)
-        .text("stopped", "true")
-        .text("paused", "true");
-    if let Some(category) = category {
-        form = form
-            .text("category", category.to_string())
-            .text("autoTMM", "true");
-    }
-    if let Some(save_path) = save_path {
-        form = form.text("savepath", save_path.to_string());
+    let mut form = multipart::Form::new().part("torrents", file_part);
+    for (name, value) in options.form_fields() {
+        form = form.text(name, value);
     }
     let response = client
         .post(format!("{base_url}/api/v2/torrents/add"))
@@ -262,6 +277,38 @@ mod tests {
         assert!(!is_magnet("/home/user/file.torrent"));
         assert!(!is_magnet("magnet"));
         assert!(!is_magnet(""));
+    }
+
+    #[test]
+    fn add_options_fields() {
+        // category alone -> autoTMM so the category's save path applies
+        let with_category = AddOptions {
+            category: Some("Anime".into()),
+            save_path: None,
+            stopped: true,
+        };
+        assert_eq!(
+            with_category.form_fields(),
+            [
+                ("stopped", "true".to_string()),
+                ("paused", "true".to_string()),
+                ("category", "Anime".to_string()),
+                ("autoTMM", "true".to_string()),
+            ]
+        );
+        // explicit save path -> no autoTMM, or it would override the path
+        let with_both = AddOptions {
+            category: Some("Anime".into()),
+            save_path: Some("/downloads/x".into()),
+            stopped: false,
+        };
+        assert_eq!(
+            with_both.form_fields(),
+            [
+                ("category", "Anime".to_string()),
+                ("savepath", "/downloads/x".to_string()),
+            ]
+        );
     }
 
     #[test]

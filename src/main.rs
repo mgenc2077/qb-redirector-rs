@@ -1,4 +1,5 @@
 mod config;
+mod import;
 mod kdialog;
 mod qbt;
 
@@ -93,6 +94,12 @@ fn run() -> Result<(), String> {
         clients.push(client);
     }
 
+    // A directory means "open folder with" batch mode: add every .torrent
+    // inside it according to the folder's import-config.json.
+    if Path::new(&target).is_dir() {
+        return run_folder_import(Path::new(&target), &config, &clients, &categories);
+    }
+
     let (targets, default_index) = build_targets(&config.instances, &categories);
     let labels: Vec<String> = targets.iter().map(|t| t.label.clone()).collect();
     let Some(choice) = kdialog::radiolist(&labels, default_index)? else {
@@ -119,17 +126,16 @@ fn run() -> Result<(), String> {
 
     // The torrent is added stopped; we find it by diffing the hash list,
     // read its files, let the user deselect some, then start it.
+    let options = qbt::AddOptions {
+        category: picked.category.clone(),
+        save_path,
+        stopped: true,
+    };
     let known_hashes = qbt::list_hashes(client, base_url).unwrap_or_default();
     if qbt::is_magnet(&target) {
-        qbt::add_magnet(client, base_url, &target, category, save_path.as_deref())?;
+        qbt::add_magnet(client, base_url, &target, &options)?;
     } else {
-        qbt::add_torrent_file(
-            client,
-            base_url,
-            Path::new(&target),
-            category,
-            save_path.as_deref(),
-        )?;
+        qbt::add_torrent_file(client, base_url, Path::new(&target), &options)?;
     }
     let hash = poll(Duration::from_secs(10), || {
         qbt::list_hashes(client, base_url)
@@ -193,6 +199,82 @@ fn run() -> Result<(), String> {
     qbt::start_torrent(client, base_url, &hash)?;
     kdialog::success_popup(&format!("Successfully sent to {}.", picked.label));
     Ok(())
+}
+
+/// Adds every .torrent in the folder, started immediately, with the category
+/// from import-config.json and the save path `<downloadPath>/<folder name>`.
+fn run_folder_import(
+    folder: &Path,
+    config: &config::Config,
+    clients: &[Client],
+    categories: &[Vec<String>],
+) -> Result<(), String> {
+    let import = import::load(folder)?;
+    let torrents = import::torrent_files(folder)?;
+    if torrents.is_empty() {
+        return Err(format!("No .torrent files in {}.", folder.display()));
+    }
+    let folder_name = folder
+        .canonicalize()
+        .map_err(|e| format!("Could not resolve {}: {e}", folder.display()))?
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or("Could not determine the folder's name.")?;
+
+    let instance_index = if let Some(name) = &import.instance {
+        config
+            .instances
+            .iter()
+            .position(|i| &i.name == name)
+            .ok_or_else(|| format!("Unknown instance {name:?} in import-config.json."))?
+    } else {
+        // Preselect the instance that actually has the requested category.
+        let preselected = import
+            .category
+            .as_ref()
+            .and_then(|c| categories.iter().position(|list| list.contains(c)))
+            .or_else(|| config.instances.iter().position(|i| i.default))
+            .unwrap_or(0);
+        let labels: Vec<String> = config.instances.iter().map(|i| i.name.clone()).collect();
+        match kdialog::radiolist(&labels, preselected)? {
+            Some(index) => index,
+            None => return Ok(()), // user cancelled
+        }
+    };
+    let instance = &config.instances[instance_index];
+    let client = &clients[instance_index];
+    let base_url = instance.url.trim_end_matches('/');
+
+    let options = qbt::AddOptions {
+        category: import.category.clone(),
+        save_path: import
+            .download_path
+            .as_deref()
+            .map(|path| import::save_path_for(path, &folder_name)),
+        stopped: false,
+    };
+    let mut failures = Vec::new();
+    for torrent in &torrents {
+        if let Err(error) = qbt::add_torrent_file(client, base_url, torrent, &options) {
+            let name = torrent.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            failures.push(format!("{name}: {error}"));
+        }
+    }
+    if failures.is_empty() {
+        kdialog::success_popup(&format!(
+            "Sent {} torrents to {}.",
+            torrents.len(),
+            instance.name
+        ));
+        Ok(())
+    } else {
+        Err(format!(
+            "{} of {} torrents failed:\n{}",
+            failures.len(),
+            torrents.len(),
+            failures.join("\n")
+        ))
+    }
 }
 
 /// Calls `check` every half second until it yields a value or the timeout
