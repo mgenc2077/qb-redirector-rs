@@ -1,7 +1,7 @@
 [Desktop Entry]
 Name=qBittorrent Router
 Comment=Send torrents to Docker instances
-Exec=/home/mgenc/.local/bin/qb-redirector-rs %U
+Exec=qb-redirector-rs %U
 Icon=qbittorrent
 Terminal=false
 Type=Application

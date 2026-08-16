@@ -1,0 +1,27 @@
+# nFPM template for deb + rpm + archlinux, built by .github/workflows/release.yaml.
+# One template serves all three formats: the package is a single binary plus a
+# .desktop entry, so no per-distro lib paths are involved. ${PKG_VERSION} is
+# expanded by nfpm from the environment (tag minus the leading "v").
+name: qb-redirector
+arch: amd64
+platform: linux
+version: "${PKG_VERSION}"
+section: net
+priority: optional
+maintainer: mgenc <dev@wedo.com.tr>
+homepage: https://github.com/mgenc2077/qb-redirector-rs
+license: GPL-3.0-only
+description: >
+  Torrent router that sends .torrent files, magnet links, and import folders
+  to one of several qBittorrent instances via their Web API, with kdialog
+  prompts for instance, category, and file selection.
+depends:
+  # Runtime dialogs; the package name is "kdialog" on Debian, Fedora, and Arch alike.
+  - kdialog
+contents:
+  - src: target/release/qb-redirector-rs
+    dst: /usr/bin/qb-redirector-rs
+  - src: qb-redirector.desktop
+    dst: /usr/share/applications/qb-redirector.desktop
+  - src: LICENSE
+    dst: /usr/share/licenses/qb-redirector/LICENSE

@@ -1,0 +1,61 @@
+name: Build Linux packages
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release'
+        required: true
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # required for softprops/action-gh-release to create the release
+    steps:
+      - uses: actions/checkout@v7
+      - name: Resolve release tag and package version
+        id: rel
+        # RAW_TAG is the pushed tag (github.ref_name) or the workflow_dispatch
+        # input. Passed via env (not inline ${{ }}) to avoid shell injection.
+        # PKG_VERSION drops the leading 'v' so packages are versioned e.g. 1.0.0.
+        env:
+          RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          # Reject anything that isn't a clean vX.Y.Z tag before it flows into
+          # package metadata: a tag/input may legally contain shell metacharacters.
+          # No hyphenated suffixes — Arch's pkgver forbids '-' entirely.
+          if ! printf '%s' "$RAW_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(\.[0-9A-Za-z.]+)?$'; then
+            echo "Refusing to release: tag '$RAW_TAG' is not a valid version (expected vX.Y.Z)" >&2
+            exit 1
+          fi
+          echo "tag=${RAW_TAG}" >> "$GITHUB_OUTPUT"
+          echo "PKG_VERSION=${RAW_TAG#v}" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable   # edition 2024 needs Rust >= 1.85
+      - name: Test
+        run: cargo test --release
+      - name: Build
+        run: cargo build --release
+
+      - name: Install nFPM
+        run: echo 'deb [trusted=yes] https://repo.goreleaser.com/apt/ /' | sudo tee /etc/apt/sources.list.d/goreleaser.list && sudo apt update && sudo apt install nfpm
+      - name: Build packages
+        # One template serves all three formats (single binary + .desktop, no
+        # per-distro paths); nfpm expands ${PKG_VERSION} from the environment,
+        # so no sed into the config is needed.
+        run: |
+          mkdir -p output
+          for packager in deb rpm archlinux; do
+            nfpm pkg --packager "$packager" --config packaging/nfpm.yaml --target output/
+          done
+
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.rel.outputs.tag }}
+          generate_release_notes: true
+          files: output/*
